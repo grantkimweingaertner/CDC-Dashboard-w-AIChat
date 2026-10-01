@@ -1,545 +1,721 @@
-"""
-U.S. Provisional Natality Exploration Dashboard (2025)
-Integrated Single-File Streamlit Application
-"""
+import os
+from typing import Optional
 
-from pathlib import Path
-from typing import Dict, Any
-import streamlit as st
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import streamlit as st
 
-# -----------------------------------------------------------------------------
-# 1. CONSTANTS & LOOKUPS
-# -----------------------------------------------------------------------------
+try:
+    from openai import OpenAI
+except ImportError:  # the app still runs; the chat tab explains what is missing
+    OpenAI = None
 
-MONTH_ORDER = [
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December"
-]
-
-STATE_TO_ABBR = {
-    "Alabama": "AL", "Alaska": "AK", "Arizona": "AZ", "Arkansas": "AR",
-    "California": "CA", "Colorado": "CO", "Connecticut": "CT", "Delaware": "DE",
-    "District of Columbia": "DC", "Florida": "FL", "Georgia": "GA", "Hawaii": "HI",
-    "Idaho": "ID", "Illinois": "IL", "Indiana": "IN", "Iowa": "IA",
-    "Kansas": "KS", "Kentucky": "KY", "Louisiana": "LA", "Maine": "ME",
-    "Maryland": "MD", "Massachusetts": "MA", "Michigan": "MI", "Minnesota": "MN",
-    "Mississippi": "MS", "Missouri": "MO", "Montana": "MT", "Nebraska": "NE",
-    "Nevada": "NV", "New Hampshire": "NH", "New Jersey": "NJ", "New Mexico": "NM",
-    "New York": "NY", "North Carolina": "NC", "North Dakota": "ND", "Ohio": "OH",
-    "Oklahoma": "OK", "Oregon": "OR", "Pennsylvania": "PA", "Rhode Island": "RI",
-    "South Carolina": "SC", "South Dakota": "SD", "Tennessee": "TN", "Texas": "TX",
-    "Utah": "UT", "Vermont": "VT", "Virginia": "VA", "Washington": "WA",
-    "West Virginia": "WV", "Wisconsin": "WI", "Wyoming": "WY",
-}
-
-SEX_COLORS = {
-    "Female": "#2b5c8f",
-    "Male": "#d95f02",
-}
-
-# -----------------------------------------------------------------------------
-# 2. PAGE CONFIGURATION
-# -----------------------------------------------------------------------------
-
+# ==============================================================================
+# 1. PAGE CONFIGURATION & GEOGRAPHIC UTILITIES
+# ==============================================================================
 st.set_page_config(
-    page_title="U.S. Provisional Natality Dashboard (2025)",
-    page_icon="📊",
-    layout="wide",
+    page_title="2025 CDC Provisional Natality Explorer",
+    page_icon="👶",
+    layout="wide"
 )
 
-# -----------------------------------------------------------------------------
-# 3. DATA LOADING & VALIDATION
-# -----------------------------------------------------------------------------
+# Mapping full US State and District names to 2-letter postal codes for Plotly choropleth rendering
+STATE_TO_ABBR = {
+    'Alabama': 'AL', 'Alaska': 'AK', 'Arizona': 'AZ', 'Arkansas': 'AR', 'California': 'CA',
+    'Colorado': 'CO', 'Connecticut': 'CT', 'Delaware': 'DE', 'District of Columbia': 'DC',
+    'Florida': 'FL', 'Georgia': 'GA', 'Hawaii': 'HI', 'Idaho': 'ID', 'Illinois': 'IL',
+    'Indiana': 'IN', 'Iowa': 'IA', 'Kansas': 'KS', 'Kentucky': 'KY', 'Louisiana': 'LA',
+    'Maine': 'ME', 'Maryland': 'MD', 'Massachusetts': 'MA', 'Michigan': 'MI', 'Minnesota': 'MN',
+    'Mississippi': 'MS', 'Missouri': 'MO', 'Montana': 'MT', 'Nebraska': 'NE', 'Nevada': 'NV',
+    'New Hampshire': 'NH', 'New Jersey': 'NJ', 'New Mexico': 'NM', 'New York': 'NY',
+    'North Carolina': 'NC', 'North Dakota': 'ND', 'Ohio': 'OH', 'Oklahoma': 'OK',
+    'Oregon': 'OR', 'Pennsylvania': 'PA', 'Rhode Island': 'RI', 'South Carolina': 'SC',
+    'South Dakota': 'SD', 'Tennessee': 'TN', 'Texas': 'TX', 'Utah': 'UT', 'Vermont': 'VT',
+    'Virginia': 'VA', 'Washington': 'WA', 'West Virginia': 'WV', 'Wisconsin': 'WI',
+    'Wyoming': 'WY'
+}
 
-def get_data_path() -> Path:
-    """Resolve file path across root and data/ directories."""
-    current_dir = Path(__file__).resolve().parent
-    candidate_paths = [
-        current_dir / "Provisional_Natality_2025_CDC.csv",
-        current_dir / "data" / "Provisional_Natality_2025_CDC.csv",
-        Path("Provisional_Natality_2025_CDC.csv"),
-        Path("data/Provisional_Natality_2025_CDC.csv"),
-    ]
-    for path in candidate_paths:
-        if path.exists():
-            return path
-    raise FileNotFoundError(
-        "Provisional_Natality_2025_CDC.csv not found in current folder or data/ folder."
-    )
+MONTH_ORDER = [
+    'January', 'February', 'March', 'April', 'May', 'June',
+    'July', 'August', 'September', 'October', 'November', 'December'
+]
 
+REQUIRED_COLUMNS = ['state_of_residence', 'month', 'month_code', 'year_code', 'sex_of_infant', 'births']
 
-def validate_raw_data(df: pd.DataFrame) -> None:
-    """Validate dataframe structure and data integrity."""
-    required_cols = {
-        "state_of_residence", "month", "month_code",
-        "year_code", "sex_of_infant", "births"
-    }
-    missing_cols = required_cols - set(df.columns)
-    if missing_cols:
-        raise ValueError(f"Missing required columns: {missing_cols}")
+# --- AI assistant constants -------------------------------------------------------
+# Provider detection by API-key prefix.
+LLM_PROVIDERS = {
+    "gsk_": {
+        "name": "Groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "default_model": "openai/gpt-oss-120b",
+    },
+    "xai-": {
+        "name": "xAI (Grok)",
+        "base_url": "https://api.x.ai/v1",
+        "default_model": "grok-3-mini",
+    },
+}
 
-    if df.empty:
-        raise ValueError("The dataset is empty.")
+# Secret names accepted for the API key (first one found is used).
+API_KEY_SECRET_NAMES = ["GROQ_API_KEY", "GROK_API_KEY", "XAI_API_KEY", "LLM_API_KEY"]
 
-    if not pd.api.types.is_numeric_dtype(df["births"]):
-        raise TypeError("Column 'births' must be numeric.")
+# Groq models tried, in order, if the preferred model is retired or unavailable.
+GROQ_FALLBACK_MODELS = [
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
+    "llama-3.3-70b-versatile",
+]
 
-    if (df["births"] < 0).any():
-        raise ValueError("Column 'births' contains negative values.")
+# Substrings (lower-case) that identify a "model unavailable" API error.
+MODEL_UNAVAILABLE_PHRASES = [
+    "not found",
+    "decommissioned",
+    "deprecated",
+    "does not exist",
+    "not available",
+    "model_not_found",
+    "model_decommissioned",
+]
 
+SUGGESTED_QUESTIONS = [
+    "Which 3 states had the most births?",
+    "Which month had the fewest births, and why might that be?",
+    "What is the male-to-female ratio in the current selection?",
+]
 
-@st.cache_data(show_spinner="Loading CDC Natality Data...")
-def load_and_preprocess_data() -> pd.DataFrame:
-    """Load, clean, order categorical variables, and map state abbreviations."""
-    file_path = get_data_path()
+MAX_HISTORY_MESSAGES = 6   # only the most recent messages are sent to the model
+
+LLM_TEMPERATURE = 0.2
+LLM_MAX_TOKENS = 2000      # gpt-oss is a reasoning model and spends tokens "thinking"
+
+EMPTY_ANSWER_MESSAGE = "The model returned an empty answer. Please try rephrasing your question."
+
+SYSTEM_PROMPT = """You are a friendly data assistant for the CDC/NCHS provisional 2025 U.S. natality (births) data.
+
+Rules:
+- Answer ONLY from the DATA SUMMARY below. It reflects the user's current sidebar filters.
+- All values are raw birth COUNTS, not birth rates. When comparing states, remind the user that population size drives the counts.
+- The data is provisional and may be revised.
+- If a question cannot be answered from the data (for example race, mother's age, or other years), say so and suggest what data would be needed.
+- Use thousands separators, double-check your arithmetic, and be concise."""
+
+# ==============================================================================
+# 2. DATA LOADING & VALIDATION
+# ==============================================================================
+@st.cache_data
+def load_and_validate_data(file_path: str = "Provisional_Natality_2025_CDC.csv") -> pd.DataFrame:
+    """Loads dataset, executes data validation checks, sets categorical month ordering,
+    and maps state postal codes for map rendering."""
+    if not os.path.exists(file_path):
+        st.error(f"Dataset missing at location: {file_path}. Please place 'Provisional_Natality_2025_CDC.csv' in the root directory.")
+        st.stop()
+        
     df = pd.read_csv(file_path)
-    validate_raw_data(df)
+    
+    # Validation Check 1: Required columns
+    missing_cols = [col for col in REQUIRED_COLUMNS if col not in df.columns]
+    if missing_cols:
+        st.error(f"Data Validation Error: Missing required columns: {missing_cols}")
+        st.stop()
+        
+    # Validation Check 2: Non-negative birth counts
+    if (df['births'] < 0).any():
+        st.error("Data Validation Error: Negative values detected in 'births' column.")
+        st.stop()
 
-    # State postal code mapping
-    df["state_abbr"] = df["state_of_residence"].map(STATE_TO_ABBR)
+    # Validation Check 3: Check for null values
+    if df[REQUIRED_COLUMNS].isnull().any().any():
+        st.warning("Notice: Null values found in dataset. Rows with nulls in key fields will be dropped.")
+        df = df.dropna(subset=REQUIRED_COLUMNS)
 
-    # Clean and order chronological months
-    df["month"] = df["month"].astype(str).str.strip()
-    df["month"] = pd.Categorical(df["month"], categories=MONTH_ORDER, ordered=True)
-
-    # Clean strings and enforce integer counts
-    df["sex_of_infant"] = df["sex_of_infant"].astype(str).str.strip()
-    df["births"] = df["births"].astype(int)
-
+    # Convert month column to Categorical to preserve chronological ordering
+    df['month'] = pd.Categorical(df['month'], categories=MONTH_ORDER, ordered=True)
+    
+    # Add state 2-letter code mapping
+    df['state_abbr'] = df['state_of_residence'].map(STATE_TO_ABBR)
+    
     return df
 
-# -----------------------------------------------------------------------------
-# 4. KPI METRIC COMPUTATIONS
-# -----------------------------------------------------------------------------
+# ==============================================================================
+# 3. SIDEBAR FILTERS COMPONENT
+# ==============================================================================
+def render_sidebar(df):
+    """Renders sidebar filters, action buttons, and active selection summaries."""
+    st.sidebar.header("Filter Options")
+    
+    all_states = sorted(df['state_of_residence'].unique().tolist())
+    all_months = [m for m in df['month'].cat.categories if m in df['month'].unique()]
+    all_sexes = ['All', 'Female', 'Male']
+    
+    # Initialize session state for filter selections if not set
+    if 'selected_states' not in st.session_state:
+        st.session_state.selected_states = all_states
+    if 'selected_months' not in st.session_state:
+        st.session_state.selected_months = all_months
+    if 'selected_sex' not in st.session_state:
+        st.session_state.selected_sex = 'All'
 
-def compute_kpis(filtered_df: pd.DataFrame) -> Dict[str, Any]:
-    """Calculate summary figures from the active filtered slice."""
+    # Action Buttons: Select All & Reset
+    col1, col2 = st.sidebar.columns(2)
+    if col1.button("Select All"):
+        st.session_state.selected_states = all_states
+        st.session_state.selected_months = all_months
+        st.session_state.selected_sex = 'All'
+        st.rerun()
+
+    if col2.button("Reset Filters"):
+        st.session_state.selected_states = all_states
+        st.session_state.selected_months = all_months
+        st.session_state.selected_sex = 'All'
+        st.rerun()
+
+    # Multiselect Inputs
+    selected_states = st.sidebar.multiselect(
+        "Select State/Geography:",
+        options=all_states,
+        default=st.session_state.selected_states
+    )
+    
+    selected_months = st.sidebar.multiselect(
+        "Select Month:",
+        options=all_months,
+        default=st.session_state.selected_months
+    )
+
+    selected_sex = st.sidebar.selectbox(
+        "Select Infant Sex:",
+        options=all_sexes,
+        index=all_sexes.index(st.session_state.selected_sex)
+    )
+
+    # Sync back to session state
+    st.session_state.selected_states = selected_states
+    st.session_state.selected_months = selected_months
+    st.session_state.selected_sex = selected_sex
+
+    # Active Filters Summary Box
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Active Filter Summary")
+    st.sidebar.info(
+        f"**Geographies Selected:** {len(selected_states)} of {len(all_states)}\n\n"
+        f"**Months Selected:** {len(selected_months)} of {len(all_months)}\n\n"
+        f"**Infant Sex Selection:** {selected_sex}"
+    )
+
+    return selected_states, selected_months, selected_sex
+
+# ==============================================================================
+# 4. KPI CARDS COMPONENT
+# ==============================================================================
+def render_kpi_cards(filtered_df):
+    """Computes and displays top-level key performance metrics."""
     if filtered_df.empty:
-        return {
-            "total_births": 0,
-            "selected_geographies": 0,
-            "avg_monthly_births": 0.0,
-            "top_geography_name": "N/A",
-            "top_geography_count": 0,
-            "peak_month_name": "N/A",
-            "peak_month_count": 0,
-        }
+        return
 
-    total_births = int(filtered_df["births"].sum())
-    num_geos = int(filtered_df["state_of_residence"].nunique())
-    num_months = max(1, int(filtered_df["month"].nunique()))
-    avg_monthly_births = total_births / num_months
+    total_births = filtered_df['births'].sum()
+    num_states = filtered_df['state_of_residence'].nunique()
+    
+    # Average births per selected month
+    month_counts = filtered_df.groupby('month', observed=True)['births'].sum()
+    avg_births_per_month = month_counts.mean() if not month_counts.empty else 0
+    top_month = month_counts.idxmax() if not month_counts.empty else "N/A"
+    
+    # Geography with highest birth count
+    state_counts = filtered_df.groupby('state_of_residence', observed=True)['births'].sum()
+    top_state = state_counts.idxmax() if not state_counts.empty else "N/A"
 
-    # Top state by count
-    geo_totals = (
-        filtered_df.groupby("state_of_residence")["births"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-    top_geo = geo_totals.index[0]
-    top_geo_val = int(geo_totals.iloc[0])
+    # Display KPI Cards
+    kpi1, kpi2, kpi3, kpi4, kpi5 = st.columns(5)
+    
+    kpi1.metric("Total Births", f"{total_births:,.0f}")
+    kpi2.metric("Selected Geographies", f"{num_states:,}")
+    kpi3.metric("Avg Births / Month", f"{avg_births_per_month:,.0f}")
+    kpi4.metric("Top Geography", f"{top_state}")
+    kpi5.metric("Top Month", f"{top_month}")
 
-    # Top month by count (respects categorical ordering)
-    month_totals = (
-        filtered_df.groupby("month", observed=False)["births"]
-        .sum()
-        .sort_values(ascending=False)
-    )
-    peak_month = str(month_totals.index[0])
-    peak_month_val = int(month_totals.iloc[0])
-
-    return {
-        "total_births": total_births,
-        "selected_geographies": num_geos,
-        "avg_monthly_births": avg_monthly_births,
-        "top_geography_name": top_geo,
-        "top_geography_count": top_geo_val,
-        "peak_month_name": peak_month,
-        "peak_month_count": peak_month_val,
-    }
-
-# -----------------------------------------------------------------------------
-# 5. VISUALIZATION GENERATORS
-# -----------------------------------------------------------------------------
-
-def plot_top_bottom_geographies(filtered_df: pd.DataFrame, top_n: int = 5) -> go.Figure:
-    """Horizontal bar chart comparing highest and lowest volume states."""
-    geo_agg = (
-        filtered_df.groupby("state_of_residence")["births"]
-        .sum()
-        .reset_index()
-        .sort_values("births", ascending=True)
-    )
-
-    if len(geo_agg) <= top_n * 2:
-        chart_data = geo_agg.copy()
-        chart_data["Group"] = "Selected Entities"
-    else:
-        bottoms = geo_agg.head(top_n).copy()
-        bottoms["Group"] = f"Bottom {top_n}"
-        tops = geo_agg.tail(top_n).copy()
-        tops["Group"] = f"Top {top_n}"
-        chart_data = pd.concat([bottoms, tops])
-
-    fig = px.bar(
-        chart_data,
-        x="births",
-        y="state_of_residence",
-        color="Group",
-        orientation="h",
-        labels={"births": "Total Births", "state_of_residence": "State / Geography"},
-        title=f"Highest and Lowest Birth Volumes (Top & Bottom {top_n})",
-        color_discrete_map={
-            f"Top {top_n}": "#2b5c8f",
-            f"Bottom {top_n}": "#d95f02",
-            "Selected Entities": "#2b5c8f",
-        },
-    )
-    fig.update_layout(
-        xaxis=dict(rangemode="tozero", tickformat=","),
-        yaxis=dict(categoryorder="total ascending"),
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=30),
-        legend_title_text="",
-    )
-    fig.update_traces(hovertemplate="<b>%{y}</b><br>Births: %{x:,.0f}<extra></extra>")
-    return fig
-
-
-def plot_macro_trendline(filtered_df: pd.DataFrame) -> go.Figure:
-    """Aggregate monthly time-series line chart."""
-    trend = (
-        filtered_df.groupby("month", observed=False)["births"]
-        .sum()
-        .reset_index()
-    )
+# ==============================================================================
+# 5. CHARTS AND VISUALIZATIONS
+# ==============================================================================
+def plot_monthly_trend(df):
+    """Generates monthly birth trend line chart (non-truncated axes)."""
+    monthly_data = df.groupby('month', observed=True)['births'].sum().reset_index()
     fig = px.line(
-        trend,
-        x="month",
-        y="births",
+        monthly_data, 
+        x='month', 
+        y='births', 
         markers=True,
-        labels={"month": "Month", "births": "Total Births"},
-        title="Aggregate Monthly Birth Trend",
+        title="Total Births by Month (Chronological)",
+        labels={'month': 'Month', 'births': 'Birth Count'},
+        color_discrete_sequence=['#1f77b4']
     )
-    fig.update_traces(
-        line=dict(color="#1f77b4", width=3),
-        marker=dict(size=8),
-        hovertemplate="Month: <b>%{x}</b><br>Births: %{y:,.0f}<extra></extra>",
-    )
-    fig.update_layout(
-        yaxis=dict(rangemode="tozero", tickformat=","),
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=30),
-    )
+    fig.update_yaxes(rangemode='tozero')
+    fig.update_traces(hovertemplate="<b>%{x}</b><br>Births: %{y:,}<extra></extra>")
+    fig.update_layout(margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
-
-def plot_choropleth_map(filtered_df: pd.DataFrame) -> go.Figure:
-    """Interactive US Choropleth map with state abbreviations."""
-    state_totals = (
-        filtered_df.dropna(subset=["state_abbr"])
-        .groupby(["state_of_residence", "state_abbr"])["births"]
-        .sum()
-        .reset_index()
-    )
+def plot_choropleth(df):
+    """Renders US state-level choropleth map."""
+    state_data = df.groupby(['state_abbr', 'state_of_residence'], observed=True)['births'].sum().reset_index()
     fig = px.choropleth(
-        state_totals,
-        locations="state_abbr",
+        state_data,
+        locations='state_abbr',
         locationmode="USA-states",
-        color="births",
+        color='births',
         scope="usa",
-        color_continuous_scale="Blues",
-        labels={"births": "Total Births"},
-        hover_name="state_of_residence",
-        title="Geographic Distribution of Provisional Births",
+        hover_name='state_of_residence',
+        color_continuous_scale="Viridis",
+        title="Birth Counts by US State",
+        labels={'births': 'Total Births'}
     )
-    fig.update_traces(
-        hovertemplate="<b>%{hovertext}</b> (%{location})<br>Births: %{z:,.0f}<extra></extra>"
-    )
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=40, b=0),
-        coloraxis_colorbar=dict(title="Births", tickformat=","),
-    )
+    fig.update_traces(hovertemplate="<b>%{hovertext}</b><br>Total Births: %{z:,}<extra></extra>")
+    fig.update_layout(margin=dict(l=0, r=0, t=40, b=0))
     return fig
 
-
-def plot_state_rankings(filtered_df: pd.DataFrame) -> go.Figure:
-    """Full ranked horizontal bar chart of selected states."""
-    geo_totals = (
-        filtered_df.groupby("state_of_residence")["births"]
-        .sum()
-        .reset_index()
-        .sort_values("births", ascending=True)
-    )
+def plot_state_ranking(df):
+    """Renders horizontal bar chart of top/bottom state birth totals."""
+    state_data = df.groupby('state_of_residence', observed=True)['births'].sum().reset_index()
+    state_data = state_data.sort_values(by='births', ascending=True)
+    
     fig = px.bar(
-        geo_totals,
-        x="births",
-        y="state_of_residence",
-        orientation="h",
-        labels={"births": "Total Births", "state_of_residence": "State / Geography"},
-        title="Total Births by State (Ranked)",
+        state_data, 
+        y='state_of_residence', 
+        x='births', 
+        orientation='h',
+        title="State Birth Count Rankings",
+        labels={'state_of_residence': 'State', 'births': 'Birth Count'},
+        color_discrete_sequence=['#2ca02c']
     )
-    fig.update_traces(
-        marker_color="#2b5c8f",
-        hovertemplate="<b>%{y}</b><br>Births: %{x:,.0f}<extra></extra>",
-    )
-    height = max(450, len(geo_totals) * 18)
-    fig.update_layout(
-        height=height,
-        xaxis=dict(rangemode="tozero", tickformat=","),
-        yaxis=dict(categoryorder="total ascending"),
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=30),
-    )
+    fig.update_xaxes(rangemode='tozero')
+    fig.update_traces(hovertemplate="<b>%{y}</b><br>Births: %{x:,}<extra></extra>")
+    fig.update_layout(height=max(400, len(state_data) * 20), margin=dict(l=20, r=20, t=40, b=20))
     return fig
 
+def plot_top_bottom_comparison(df, n=5):
+    """Compares top N vs bottom N geographies in current selection."""
+    state_totals = df.groupby('state_of_residence', observed=True)['births'].sum().sort_values(ascending=False)
+    if len(state_totals) < 2:
+        return None
 
-def plot_monthly_sex_comparison(filtered_df: pd.DataFrame) -> go.Figure:
-    """Side-by-side grouped bar chart comparing monthly births by infant sex."""
-    trend_sex = (
-        filtered_df.groupby(["month", "sex_of_infant"], observed=False)["births"]
-        .sum()
-        .reset_index()
-    )
+    top_states = state_totals.head(n)
+    bottom_states = state_totals.tail(n).iloc[::-1]
+
+    comp_df = pd.concat([
+        pd.DataFrame({'State': top_states.index, 'Births': top_states.values, 'Group': f'Top {n}'}),
+        pd.DataFrame({'State': bottom_states.index, 'Births': bottom_states.values, 'Group': f'Bottom {n}'})
+    ])
+
     fig = px.bar(
-        trend_sex,
-        x="month",
-        y="births",
-        color="sex_of_infant",
-        barmode="group",
-        labels={"month": "Month", "births": "Births", "sex_of_infant": "Infant Sex"},
-        color_discrete_map=SEX_COLORS,
-        title="Monthly Birth Comparison by Infant Sex",
+        comp_df,
+        x='State',
+        y='Births',
+        color='Group',
+        barmode='group',
+        title=f"Comparison: Top {n} vs Bottom {n} Geographies",
+        color_discrete_sequence=['#1f77b4', '#d62728']
     )
-    fig.update_traces(
-        hovertemplate="Month: <b>%{x}</b><br>Sex: %{fullData.name}<br>Births: %{y:,.0f}<extra></extra>"
-    )
-    fig.update_layout(
-        yaxis=dict(rangemode="tozero", tickformat=","),
-        template="plotly_white",
-        margin=dict(l=20, r=20, t=50, b=30),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-    )
+    fig.update_yaxes(rangemode='tozero')
+    fig.update_traces(hovertemplate="<b>%{x}</b> (%{fullData.name})<br>Births: %{y:,}<extra></extra>")
     return fig
 
-
-def plot_state_month_heatmap(filtered_df: pd.DataFrame) -> go.Figure:
-    """Seasonality cross-tabulation heatmap (State vs. Month)."""
-    pivot = filtered_df.pivot_table(
-        index="state_of_residence",
-        columns="month",
-        values="births",
-        aggfunc="sum",
-        fill_value=0,
-        observed=False,
-    )
-    pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=True).index]
-
+def plot_state_month_heatmap(df):
+    """Renders state-by-month birth count heatmap."""
+    pivot = df.pivot_table(index='state_of_residence', columns='month', values='births', aggfunc='sum', observed=True).fillna(0)
     fig = px.imshow(
         pivot,
-        labels=dict(x="Month", y="State / Geography", color="Births"),
-        x=pivot.columns.tolist(),
-        y=pivot.index.tolist(),
-        aspect="auto",
+        labels=dict(x="Month", y="State", color="Birth Count"),
+        x=pivot.columns,
+        y=pivot.index,
         color_continuous_scale="YlGnBu",
-        title="Seasonality Heatmap: State vs. Month",
+        title="State vs Month Birth Count Heatmap"
     )
-    fig.update_traces(
-        hovertemplate="State: <b>%{y}</b><br>Month: <b>%{x}</b><br>Births: %{z:,.0f}<extra></extra>"
-    )
-    height = max(500, len(pivot) * 16)
-    fig.update_layout(
-        height=height,
-        margin=dict(l=20, r=20, t=50, b=30),
-        coloraxis_colorbar=dict(title="Births", tickformat=","),
-    )
+    fig.update_layout(height=max(400, len(pivot) * 18))
     return fig
 
-# -----------------------------------------------------------------------------
-# 6. MAIN APPLICATION EXECUTION
-# -----------------------------------------------------------------------------
+def plot_sex_comparison(df):
+    """Renders grouped bar chart comparing female and male birth counts by month."""
+    sex_month = df.groupby(['month', 'sex_of_infant'], observed=True)['births'].sum().reset_index()
+    fig = px.bar(
+        sex_month,
+        x='month',
+        y='births',
+        color='sex_of_infant',
+        barmode='group',
+        title="Monthly Birth Count Comparison by Infant Sex",
+        labels={'month': 'Month', 'births': 'Birth Count', 'sex_of_infant': 'Infant Sex'},
+        color_discrete_sequence=['#e377c2', '#1f77b4']
+    )
+    fig.update_yaxes(rangemode='tozero')
+    fig.update_traces(hovertemplate="<b>%{x}</b> (%{fullData.name})<br>Births: %{y:,}<extra></extra>")
+    return fig
 
-def main():
+# ==============================================================================
+# 6. AI DATA ASSISTANT (CHATBOT)
+# ==============================================================================
+class AllModelsUnavailableError(Exception):
+    """Raised when every configured model is retired, unknown or unavailable."""
+
+
+def get_api_key() -> Optional[str]:
+    """Returns the first API key found in Streamlit secrets, or None."""
+    for name in API_KEY_SECRET_NAMES:
+        try:
+            value = st.secrets[name]
+        except Exception:
+            continue
+        if value and str(value).strip():
+            return str(value).strip()
+    return None
+
+
+def get_provider(api_key: str) -> Optional[dict]:
+    """Detects the LLM provider from the API-key prefix."""
+    for prefix, provider in LLM_PROVIDERS.items():
+        if api_key.startswith(prefix):
+            return provider
+    return None
+
+
+def get_model_override() -> Optional[str]:
+    """Returns the optional LLM_MODEL secret, if present."""
     try:
-        df_raw = load_and_preprocess_data()
-    except Exception as exc:
-        st.error(f"Error loading dataset: {exc}")
-        st.stop()
+        value = st.secrets["LLM_MODEL"]
+    except Exception:
+        return None
+    return str(value).strip() if value and str(value).strip() else None
 
-    all_states = sorted(df_raw["state_of_residence"].unique().tolist())
-    all_months = MONTH_ORDER
-    sex_options = ["All", "Female", "Male"]
 
-    # Filter State Callbacks
-    if "selected_states" not in st.session_state:
-        st.session_state.selected_states = all_states
-    if "selected_months" not in st.session_state:
-        st.session_state.selected_months = all_months
-    if "selected_sex" not in st.session_state:
-        st.session_state.selected_sex = "All"
+def get_candidate_models(provider: dict) -> list:
+    """Builds the ordered list of models to try (the model that worked last goes first)."""
+    preferred = get_model_override() or provider["default_model"]
+    candidates = [preferred]
+    if provider["name"] == "Groq":
+        candidates += [m for m in GROQ_FALLBACK_MODELS if m != preferred]
 
-    def reset_filters():
-        st.session_state.selected_states = all_states
-        st.session_state.selected_months = all_months
-        st.session_state.selected_sex = "All"
+    active = st.session_state.get("active_model")
+    if active in candidates:
+        candidates.remove(active)
+        candidates.insert(0, active)
+    return candidates
 
-    def select_all_states():
-        st.session_state.selected_states = all_states
 
-    def select_all_months():
-        st.session_state.selected_months = all_months
+def is_model_unavailable_error(err: Exception) -> bool:
+    """True only for errors that mean the model is retired, unknown or unavailable."""
+    message = str(err).lower()
+    return any(phrase in message for phrase in MODEL_UNAVAILABLE_PHRASES)
 
-    # Sidebar
-    st.sidebar.header("Filter Controls")
 
-    st.sidebar.selectbox("Infant Sex", options=sex_options, key="selected_sex")
+def build_data_summary(df: pd.DataFrame) -> str:
+    """Builds a compact text summary of the FILTERED data (never the raw rows)."""
+    sexes = sorted(df['sex_of_infant'].unique().tolist())
+    sex_label = "All (Female and Male)" if len(sexes) > 1 else sexes[0]
+    total = int(df['births'].sum())
 
-    col_s_btn, _ = st.sidebar.columns([1, 1])
-    with col_s_btn:
-        st.button("Select All States", on_click=select_all_states, use_container_width=True)
-
-    st.sidebar.multiselect(
-        "State / Geography",
-        options=all_states,
-        key="selected_states",
-        help="Select one or multiple geographies.",
-    )
-
-    col_m_btn, _ = st.sidebar.columns([1, 1])
-    with col_m_btn:
-        st.button("Select All Months", on_click=select_all_months, use_container_width=True)
-
-    st.sidebar.multiselect(
-        "Month (Chronological)",
-        options=all_months,
-        key="selected_months",
-        help="Select calendar months.",
-    )
-
-    st.sidebar.markdown("---")
-    st.sidebar.button("Reset All Filters", on_click=reset_filters, use_container_width=True)
-
-    st.sidebar.markdown("### Active Filters Summary")
-    st.sidebar.caption(f"• **Sex:** {st.session_state.selected_sex}")
-    st.sidebar.caption(f"• **Geographies:** {len(st.session_state.selected_states)} of {len(all_states)} selected")
-    st.sidebar.caption(f"• **Months:** {len(st.session_state.selected_months)} of {len(all_months)} selected")
-
-    # Header & Context
-    st.title("U.S. Provisional Natality Exploration Dashboard (2025)")
-    st.markdown(
-        "Designed for exploratory data analysis of geographic, monthly, and infant-sex patterns "
-        "using CDC vital statistics."
-    )
-
-    st.info(
-        "**Source & Methodology Notice:**\n\n"
-        "- **Data Source:** Centers for Disease Control and Prevention (CDC) National Center for Health Statistics (NCHS).\n"
-        "- **Provisional Status:** All counts shown are provisional and subject to reporting revisions and registration delays.\n"
-        "- **Metric Definition:** Values represent raw **birth counts**, not birth or fertility rates. "
-        "High volumes reflect both birth propensity and underlying state population size."
-    )
-
-    # Filter Application
-    filtered_df = df_raw.copy()
-    if st.session_state.selected_sex != "All":
-        filtered_df = filtered_df[filtered_df["sex_of_infant"] == st.session_state.selected_sex]
-
-    filtered_df = filtered_df[
-        (filtered_df["state_of_residence"].isin(st.session_state.selected_states)) &
-        (filtered_df["month"].isin(st.session_state.selected_months))
+    lines = [
+        "DATA SUMMARY (matches the user's current sidebar filters)",
+        "",
+        "ACTIVE FILTERS:",
+        f"- Infant sex: {sex_label}",
+        f"- Geographies selected: {df['state_of_residence'].nunique():,}",
+        f"- Months selected: {df['month'].nunique():,}",
+        "",
+        f"TOTAL BIRTHS: {total:,}",
+        "",
+        "BIRTHS BY SEX:",
     ]
+    by_sex = df.groupby('sex_of_infant', observed=True)['births'].sum()
+    lines += [f"- {sex}: {int(count):,}" for sex, count in by_sex.items()]
 
+    lines += ["", "BIRTHS BY MONTH:"]
+    by_month = df.groupby('month', observed=True)['births'].sum()
+    lines += [f"- {month}: {int(count):,}" for month, count in by_month.items()]
+
+    state_sex = (
+        df.groupby(['state_of_residence', 'sex_of_infant'], observed=True)['births']
+        .sum()
+        .unstack(fill_value=0)
+    )
+    state_sex['Total'] = state_sex.sum(axis=1)
+    state_sex = state_sex.sort_values('Total', ascending=False)
+    sex_cols = [c for c in ['Female', 'Male'] if c in state_sex.columns]
+
+    lines += ["", "BIRTHS BY STATE, ranked high to low (" + " | ".join(["State", "Total"] + sex_cols) + "):"]
+    for state, row in state_sex.iterrows():
+        parts = [str(state), f"{int(row['Total']):,}"] + [f"{int(row[c]):,}" for c in sex_cols]
+        lines.append("- " + " | ".join(parts))
+
+    return "\n".join(lines)
+
+
+def create_stream_with_fallback(client, provider: dict, messages: list):
+    """Starts a streaming completion, falling back to other models ONLY when the
+    current model is unavailable. Any other error is raised normally."""
+    for model in get_candidate_models(provider):
+        kwargs = dict(
+            model=model,
+            messages=messages,
+            temperature=LLM_TEMPERATURE,
+            max_tokens=LLM_MAX_TOKENS,
+            stream=True,
+        )
+        if "gpt-oss" in model:
+            # extra_body works with any openai library version
+            kwargs["extra_body"] = {"reasoning_effort": "low"}
+        try:
+            stream = client.chat.completions.create(**kwargs)
+        except Exception as err:
+            if is_model_unavailable_error(err):
+                continue
+            raise
+        st.session_state["active_model"] = model
+        return stream
+    raise AllModelsUnavailableError("No configured model is available.")
+
+
+def stream_text(stream):
+    """Yields only the text deltas from a streaming response."""
+    for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta.content
+        if delta:
+            yield delta
+
+
+def friendly_error_message(err: Exception) -> str:
+    """Translates API errors into short, friendly messages."""
+    if isinstance(err, AllModelsUnavailableError):
+        return (
+            "None of the configured AI models are available. Add a LLM_MODEL secret "
+            "in Streamlit Cloud (⋮ → Settings → Secrets) with a model name that your "
+            "provider currently supports."
+        )
+    status = getattr(err, "status_code", None)
+    text = str(err).lower()
+    if status == 401 or "invalid api key" in text or "invalid_api_key" in text or "error code: 401" in text:
+        return "The API key was rejected. Please check the key saved in your Streamlit Secrets."
+    if status == 429 or "rate limit" in text or "rate_limit" in text or "error code: 429" in text:
+        return "The free-tier rate limit was reached. Please wait a minute and try again."
+    return f"Sorry, something went wrong contacting the AI service: {err}"
+
+
+def render_chatbot(filtered_df: pd.DataFrame):
+    """Renders the AI chat tab, grounded in the currently filtered data."""
+    st.subheader("Ask the Data Assistant")
+
+    api_key = get_api_key()
+    if not api_key:
+        st.warning(
+            "**No API key found.** To enable the assistant, add your key to Streamlit Cloud: "
+            "open your app, click **⋮ → Settings → Secrets**, and add a line like "
+            "`GROQ_API_KEY = \"gsk_your_key_here\"`, then save."
+        )
+        return
+
+    provider = get_provider(api_key)
+    if provider is None:
+        st.warning(
+            "The API key format is not recognized. Groq keys start with `gsk_` and xAI keys "
+            "start with `xai-`. Please check the key saved in **⋮ → Settings → Secrets**."
+        )
+        return
+
+    if OpenAI is None:
+        st.error("The 'openai' package is not installed. Add `openai>=1.40.0` to requirements.txt.")
+        return
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "active_model" not in st.session_state:
+        st.session_state["active_model"] = get_model_override() or provider["default_model"]
+
+    caption_slot = st.empty()
+
+    def show_caption():
+        caption_slot.caption(
+            f"Powered by {provider['name']} · model {st.session_state['active_model']}. "
+            "Answers are based on the data matching your current sidebar filters. "
+            "AI can make mistakes — verify key numbers with the charts."
+        )
+
+    show_caption()
+
+    # Suggested questions + clear button
+    pending_question = None
+    cols = st.columns(len(SUGGESTED_QUESTIONS) + 1)
+    for i, question in enumerate(SUGGESTED_QUESTIONS):
+        if cols[i].button(question, key=f"suggested_{i}", width="stretch"):
+            pending_question = question
+    if cols[-1].button("🗑️ Clear chat", key="clear_chat", width="stretch"):
+        st.session_state.messages = []
+        st.rerun()
+
+    # Chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    typed_question = st.chat_input("Ask a question about the births data…")
+    user_question = pending_question or typed_question
+    if not user_question:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": user_question})
+    with st.chat_message("user"):
+        st.markdown(user_question)
+
+    with st.chat_message("assistant"):
+        try:
+            client = OpenAI(api_key=api_key, base_url=provider["base_url"], timeout=60.0)
+            system_message = {
+                "role": "system",
+                "content": SYSTEM_PROMPT + "\n\n" + build_data_summary(filtered_df),
+            }
+            recent = st.session_state.messages[-MAX_HISTORY_MESSAGES:]
+            stream = create_stream_with_fallback(client, provider, [system_message] + recent)
+            answer = st.write_stream(stream_text(stream))
+            if not isinstance(answer, str) or not answer.strip():
+                answer = EMPTY_ANSWER_MESSAGE
+                st.markdown(answer)
+        except Exception as err:
+            answer = friendly_error_message(err)
+            st.markdown(answer)
+
+    st.session_state.messages.append({"role": "assistant", "content": answer})
+    show_caption()
+
+# ==============================================================================
+# 7. TAB RENDERING
+# ==============================================================================
+def render_overview_tab(filtered_df):
+    st.subheader("Overview & Macro Trends")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(plot_choropleth(filtered_df), width="stretch")
+    with col2:
+        st.plotly_chart(plot_monthly_trend(filtered_df), width="stretch")
+
+def render_geo_tab(filtered_df):
+    st.subheader("Geographic Distribution Analysis")
+    top_bot_fig = plot_top_bottom_comparison(filtered_df)
+    if top_bot_fig:
+        st.plotly_chart(top_bot_fig, width="stretch")
+    
+    col1, col2 = st.columns([1, 1])
+    with col1:
+        st.plotly_chart(plot_state_ranking(filtered_df), width="stretch")
+    with col2:
+        st.plotly_chart(plot_state_month_heatmap(filtered_df), width="stretch")
+
+def render_monthly_sex_tab(filtered_df):
+    st.subheader("Monthly and Sex-Based Patterns")
+    st.plotly_chart(plot_sex_comparison(filtered_df), width="stretch")
+
+def render_data_tab(filtered_df):
+    st.subheader("Data Explorer & Export")
+    
+    # Search input filter for table
+    search_term = st.text_input("Search state within current filtered table:", "")
+    display_df = filtered_df.copy()
+    
+    if search_term:
+        display_df = display_df[display_df['state_of_residence'].str.contains(search_term, case=False, na=False)]
+        
+    st.dataframe(
+        display_df.style.format({'births': '{:,}'}),
+        width="stretch",
+        hide_index=True
+    )
+    
+    # Download button for CSV export
+    csv_data = filtered_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="Download Filtered Data (CSV)",
+        data=csv_data,
+        file_name="filtered_cdc_natality_2025.csv",
+        mime="text/csv"
+    )
+
+def render_about_tab():
+    st.subheader("About the CDC Natality Dataset")
+    st.markdown("""
+    ### Data Context & Methodology
+    * **Source:** Centers for Disease Control and Prevention (CDC) - National Center for Health Statistics (NCHS)[cite: 1].
+    * **Data Type:** Provisional Natality Figures (2025)[cite: 1].
+    * **Key Distinction:** This dataset reports raw **birth counts**, not **birth rates**. Birth counts reflect total volume, whereas birth rates adjust for population size per geography.
+    * **Provisional Status:** Provisional counts are subject to revision as additional records are finalized by reporting jurisdictions[cite: 1].
+    
+    ### Educational Objectives for Business Analytics
+    * Visualizing time-series trends without zero-axis truncation.
+    * Exploring geographic disparity using interactive choropleth mapping.
+    * Dynamic aggregation and filtering across tabular variables.
+    """)
+
+# ==============================================================================
+# 8. MAIN APPLICATION EXECUTION
+# ==============================================================================
+def main():
+    # Header Section
+    st.title("2025 CDC Provisional Natality Dashboard")
+    st.caption("Interactive analysis of provisional US birth counts by geography, month, and infant sex.")
+    
+    st.warning(
+        "**Important Notice:** Data displayed are **provisional figures** provided by the **CDC/NCHS**[cite: 1]. "
+        "All numbers represent raw **birth counts**, NOT birth rates."
+    )
+
+    # Load & Validate Data
+    df = load_and_validate_data()
+
+    # Render Sidebar Filters
+    selected_states, selected_months, selected_sex = render_sidebar(df)
+
+    # Apply Filters
+    filtered_df = df[
+        (df['state_of_residence'].isin(selected_states)) &
+        (df['month'].isin(selected_months))
+    ]
+    
+    if selected_sex != 'All':
+        filtered_df = filtered_df[filtered_df['sex_of_infant'] == selected_sex]
+
+    # Handle Empty Filter Selection
     if filtered_df.empty:
-        st.warning("⚠️ No observations match your current filter selections. Please expand your filter criteria in the sidebar.")
-        st.stop()
+        st.error("⚠️ No observations match the current filter selection. Please adjust your filters in the sidebar.")
+        return
 
-    # Dynamic KPI Cards
-    kpis = compute_kpis(filtered_df)
-    kpi_col1, kpi_col2, kpi_col3, kpi_col4, kpi_col5 = st.columns(5)
-    kpi_col1.metric("Total Births", f"{kpis['total_births']:,}")
-    kpi_col2.metric("Selected Geographies", f"{kpis['selected_geographies']}")
-    kpi_col3.metric("Avg Births / Month", f"{kpis['avg_monthly_births']:,.0f}")
-    kpi_col4.metric("Top Geography", kpis["top_geography_name"], f"{kpis['top_geography_count']:,} births", delta_color="off")
-    kpi_col5.metric("Peak Month", kpis["peak_month_name"], f"{kpis['peak_month_count']:,} births", delta_color="off")
-
+    # Render Top KPI Cards
+    render_kpi_cards(filtered_df)
     st.markdown("---")
 
-    # Tabs
-    tab_overview, tab_geo, tab_monthly_sex, tab_table, tab_about = st.tabs([
+    # Main Navigation Tabs
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
         "Overview",
         "Geographic Analysis",
         "Monthly & Sex Analysis",
+        "🤖 Ask the Data (AI)",
         "Data Table & Download",
-        "About the Data",
+        "About the Data"
     ])
 
-    with tab_overview:
-        c1, c2 = st.columns([1, 1])
-        with c1:
-            st.plotly_chart(plot_top_bottom_geographies(filtered_df, top_n=5), use_container_width=True)
-        with c2:
-            st.plotly_chart(plot_macro_trendline(filtered_df), use_container_width=True)
+    with tab1:
+        render_overview_tab(filtered_df)
 
-    with tab_geo:
-        st.subheader("Geographic Distribution")
-        st.plotly_chart(plot_choropleth_map(filtered_df), use_container_width=True)
-        st.markdown("#### State Volume Rankings")
-        st.plotly_chart(plot_state_rankings(filtered_df), use_container_width=True)
+    with tab2:
+        render_geo_tab(filtered_df)
 
-    with tab_monthly_sex:
-        st.subheader("Monthly Seasonality & Sex Breakdown")
-        st.plotly_chart(plot_monthly_sex_comparison(filtered_df), use_container_width=True)
-        st.markdown("#### Geographic Seasonality Matrix")
-        st.plotly_chart(plot_state_month_heatmap(filtered_df), use_container_width=True)
+    with tab3:
+        render_monthly_sex_tab(filtered_df)
 
-    with tab_table:
-        st.subheader("Searchable Filtered Records")
-        display_df = filtered_df[[
-            "state_of_residence", "month", "sex_of_infant", "births"
-        ]].rename(columns={
-            "state_of_residence": "State",
-            "month": "Month",
-            "sex_of_infant": "Infant Sex",
-            "births": "Birth Count",
-        })
-        st.dataframe(
-            display_df.style.format({"Birth Count": "{:,}"}),
-            use_container_width=True,
-            hide_index=True,
-        )
-        csv_buffer = display_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="📥 Download Filtered Data as CSV",
-            data=csv_buffer,
-            file_name="filtered_provisional_natality_2025.csv",
-            mime="text/csv",
-        )
+    with tab4:
+        render_chatbot(filtered_df)
 
-    with tab_about:
-        st.subheader("Data Documentation & Analytics Guidance")
-        st.markdown(
-            """
-            ### Background and Provenance
-            This dataset originates from the **Centers for Disease Control and Prevention (CDC)** National Vital Statistics System (NVSS).
-            The records document provisional monthly live birth counts categorized by maternal state of residence and infant sex for the year 2025.
+    with tab5:
+        render_data_tab(filtered_df)
 
-            ### Critical Analytical Notes for Students
-            1. **Counts vs. Rates:**
-               * The figures presented are raw birth counts ($N$).
-               * Larger values in states such as California, Texas, and Florida primarily reflect base population rather than higher birth rates.
-               * To calculate standardized birth rates in deeper analytics exercises, join these counts with U.S. Census Bureau population estimates:
-                 $$\\text{Crude Birth Rate} = \\frac{\\text{Total Births}}{\\text{Total Population}} \\times 1{,}000$$
-            2. **Provisional Data Considerations:**
-               * Provisional data files reflect ongoing vital record reporting.
-               * Counts for the most recent reporting months are subject to upward revisions as late certificates are processed.
-            3. **Sex Ratio at Birth:**
-               * Across large demographic samples, the natural human secondary sex ratio at birth typically hovers around 105 male births per 100 female births (~51.2% male).
-               * Students can test for statistical deviations from this ratio across states using chi-squared goodness-of-fit tests.
-            """
-        )
+    with tab6:
+        render_about_tab()
 
 if __name__ == "__main__":
     main()
